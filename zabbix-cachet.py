@@ -70,6 +70,19 @@ class Zabbix:
         return version
 
     @pyzabbix_safe({})
+    def get_item(self, host, item):
+        """
+        Get item information
+        @param host: string
+        @param item: string
+        @return: dict
+        """
+        zitem = self.zapi.item.get(
+                host=host,
+                itemids=item)
+        return zitem[0]
+
+    @pyzabbix_safe({})
     def get_trigger(self, triggerid):
         """
         Get trigger information
@@ -100,7 +113,7 @@ class Zabbix:
         return zbx_event
 
     @pyzabbix_safe([])
-    def get_itservices(self, root=None):
+    def get_itservices(self, root=None, max_depth=2):
         """
         Return tree of Zabbix IT Services
         root (hidden)
@@ -141,6 +154,7 @@ class Zabbix:
         known_ids = []
         # At first proceed services with dependencies as groups
         service_tree = [i for i in services if i['dependencies']]
+        depth = 0
         for idx, service in enumerate(service_tree):
             child_services_ids = []
             for dependency in service['dependencies']:
@@ -155,7 +169,7 @@ class Zabbix:
         # At proceed services without dependencies as singers
         singers_services = [i for i in services if i['serviceid'] not in known_ids]
         if singers_services:
-            service_tree = service_tree + singers_services
+            service_tree = service_tree# + singers_services
         return service_tree
 
 
@@ -387,7 +401,7 @@ class Cachet:
             return {'id': 0, 'name': 'Does not exists'}
         return data
 
-    def new_components_gr(self, name):
+    def new_components_gr(self, name, enabled=True):
         """
         Create new components group
         @param name: string
@@ -398,7 +412,7 @@ class Cachet:
         if components_gr_id['id'] == 0:
             url = 'components/groups'
             # TODO: make if possible to configure default collapsed value
-            params = {'name': name, 'collapsed': 2}
+            params = {'name': name, 'collapsed': 2, 'enabled': enabled}
             logging.debug('Creating Component Group {}...'.format(params['name']))
             data = self._http_post(url, params)
             if 'data' in data:
@@ -406,6 +420,100 @@ class Cachet:
             return data['data']
         else:
             return components_gr_id
+
+    def get_metrics(self, name=None):
+        """
+        Get all registered metrics or return a metric details if name specified
+        Please note, it name was not defined method returns only last page of data
+        :param name: Name of component to search
+        :type name: str
+        :return: Data =)
+        :rtype: dict or list
+        """
+        url = 'metrics'
+        data = self._http_get(url)
+        total_pages = int(data['meta']['pagination']['total_pages'])
+        if name:
+            metrics = []
+            for page in range(total_pages, 0, -1):
+                if page == 1:
+                    data_page = data
+                else:
+                    data_page = self._http_get(url, params={'page': page})
+                for metric in data_page['data']:
+                    if metric['name'] == name:
+                        metrics.append(metric)
+            if len(metrics) < 1:
+                return {'id': 0, 'name': 'Does not exists'}
+            else:
+                return metrics
+        return data
+
+    def get_metric(self, id):
+        """
+        Get metric params based its id
+        @param id: string
+        @return: dict
+        """
+        url = 'metrics/' + str(id)
+        data = self._http_get(url)
+        return data['data']
+
+    def new_metrics(self, name, **kwargs):
+        """
+        Create new components
+        @param name: string
+        @param kwargs: various additional values =)
+        @return: dict of data
+        """
+        # Get values for new component
+        params = {'name': name, 'suffix': '', 'description': '', 'default_value': 0}
+        params.update(kwargs)
+        # Do not post empty params to Cachet
+        for i in ('suffix', 'description'):
+            # Strip params to avoid empty (' ') values #24  
+            if str(params[i]).strip() == '':
+                params.pop(i)
+        # Check if metrics with same name already exists 
+        metric = self.get_metrics(name=name)
+        # There are more that one metric with same name already
+        if isinstance(metric, list):
+            for i in metric:
+                if i['name'] == name:
+                    return i
+        elif isinstance(metric, dict):
+            if not metric['id'] == 0:
+                return metric
+        # Create component if it does not exist or exist in other group
+        url = 'metrics'
+        # params = {'name': name, 'link': link, 'description': description, 'status': status}
+        logging.debug('Creating Cachet metric {name}...'.format(name=params['name']))
+        data = self._http_post(url, params)
+        logging.info('Metric {name} was created in with suffix {suffix}.'.format(name=params['name'],
+                                                                                   suffix=data['data'][
+                                                                                       'suffix']))
+        return data['data']
+
+    def new_metric_point(self, id, **kwargs):
+        """
+        Add a point to the given metric
+        @param id: string
+        @param kwargs: various additional values =)
+        @return: boolean
+        """
+        metric = self.get_metric(id)
+        if metric['id'] == 0:
+            logging.error('Tried to add a new data point to metric {id} but it does not exist.'.format(id=id))
+            return {}
+
+        url = 'metrics/' + str(id) + '/points'
+        params = {'value': 0, 'timestamp': '0'}
+        params.update(kwargs)
+        data = self._http_post(url, params)
+        logging.info('Datapoint from time {timestamp} was added to metric {id}'.format(
+            timestamp=params['timestamp'],
+            id=id))
+        return data['data']
 
     def get_incident(self, component_id):
         """
@@ -590,7 +698,7 @@ def triggers_watcher(service_map):
             # TODO: ServiceID
             # inc_msg = 'TODO: ServiceID'
             continue
-
+    
     return True
 
 
@@ -618,6 +726,42 @@ def triggers_watcher_worker(service_map, interval, event):
     logging.info('end trigger watcher')
 
 
+def items_watcher(items_map):
+    for i in items_map:
+        item = zapi.get_item(i['itemhost'], i['itemid'])
+        if "lastvalue" not in item:
+            logging.error('Cannot get value for item {}'.format(i['itemid']))
+            continue
+        if 'lastclock' not in item:
+            logging.error('Cannot get timestamp for item {}'.format(i['itemid']))
+            continue
+        
+        value = int(int(item['lastvalue'])/i['multiple'])
+        cachet.new_metric_point(i['metricid'], value=str(value), timestamp=item['lastclock'])
+
+def items_watcher_worker(items_map, interval, event):
+    """
+    Worker for items_watcher. Run it continuously with specific interval
+    @param items_map: list of tuples
+    @param interval: interval in seconds
+    @param event: threading.Event object
+    @return :
+    """
+    logging.info('start item watcher')
+    while not event.is_set():
+        logging.debug('check Zabbix triggers')
+        # Do not run if Zabbix is not available
+        if zapi.get_version():
+            try:
+                items_watcher(items_map)
+            except Exception as e:
+                logging.error('items_watcher() raised an Exception. Something gone wrong')
+                logging.error(e, exc_info=True)
+        else:
+            logging.error('Zabbix is not available. Skip checking...')
+        time.sleep(interval)
+    logging.info('end item watcher')
+
 def init_cachet(services):
     """
     Init Cachet by syncing Zabbix service to it
@@ -627,11 +771,14 @@ def init_cachet(services):
     """
     # Zabbix Triggers to Cachet components id map
     data = []
+    processed = {}
     for zbx_service in services:
         # Check if zbx_service has childes
         zxb2cachet_i = {}
+        print(processed)
         if zbx_service['dependencies']:
-            group = cachet.new_components_gr(zbx_service['name'])
+            disabled = zbx_service['serviceid'] in processed
+            group = cachet.new_components_gr(zbx_service['name'], enabled=(not disabled))
             for dependency in zbx_service['dependencies']:
                 # Component without trigger
                 if int(dependency['triggerid']) != 0:
@@ -651,6 +798,7 @@ def init_cachet(services):
                                      'component_id': component['id'],
                                      'component_name': component['name']
                                      })
+                processed[dependency['serviceid']] = True
                 data.append(zxb2cachet_i)
         else:
             # Component with trigger
@@ -698,6 +846,8 @@ if __name__ == '__main__':
     CACHET = config['cachet']
     SETTINGS = config['settings']
 
+    items_map = config['items']
+
     # Templates for incident displaying
     acknowledgement_tmpl_d = "{message}\n\n###### {ack_time} by {author}\n\n______\n"
     templates = config.get('templates')
@@ -721,10 +871,25 @@ if __name__ == '__main__':
     logging.info('Zabbix Cachet v.{} started'.format(__version__))
     inc_update_t = threading.Thread()
     event = threading.Event()
+    event1 = threading.Event()
+    
     try:
         zapi = Zabbix(ZABBIX['server'], ZABBIX['user'], ZABBIX['pass'], ZABBIX['https-verify'])
         cachet = Cachet(CACHET['server'], CACHET['token'], CACHET['https-verify'])
         logging.info('Zabbix ver: {}. Cachet ver: {}'.format(zapi.version, cachet.version))
+
+        logging.debug('Creating item metrics ...')
+        for item in items_map.values():
+            metric = cachet.new_metrics(item['name'], **item['config'])
+            item['metricid'] = metric['id']
+
+        logging.debug('Starting items_watcher worker')
+        inc_update_t = threading.Thread(name='Items Watcher',
+                                        target=items_watcher_worker,
+                                        args=(items_map.values(), SETTINGS['update_item_interval'], event1))
+        inc_update_t.daemon = True
+        inc_update_t.start()
+
         zbxtr2cachet = ''
         while True:
             logging.debug('Getting list of Zabbix IT Services ...')
@@ -761,6 +926,7 @@ if __name__ == '__main__':
 
     except KeyboardInterrupt:
         event.set()
+        event1.set()
         logging.info('Shutdown requested. See you.')
     except Exception as error:
         logging.error(error)
